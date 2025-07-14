@@ -1,0 +1,9 @@
+streamlit
+langchain
+langchain-community
+langchain-openai
+unstructured[all-docs]
+faiss-cpu
+sentence-transformers
+pandas
+openai
