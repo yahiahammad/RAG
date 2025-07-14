@@ -68,18 +68,18 @@ def rag(retrieved_docs, query):
     answer = response.choices[0].message.content
     return answer # Return the answer string
 
-def prepare_excel_data(uploaded_file, query, k=2):
+def create_excel_database(uploaded_file):
     """
-    Loads data from an uploaded Excel file, creates document chunks,
-    builds a FAISS index, performs similarity search, and uses RAG to answer a query.
+    Creates a FAISS database from an uploaded Excel file and returns the index and document chunks.
 
     Args:
         uploaded_file: The uploaded file object from Streamlit.
-        query: The user's query string.
-        k: The number of most similar document chunks to retrieve (default is 2).
 
     Returns:
-        str: The generated answer from the RAG function.
+        A tuple containing:
+            - faiss.IndexFlatL2: The created FAISS index.
+            - list: A list of document chunks (langchain.schema.document.Document objects).
+        Returns None if an error occurs.
     """
     # Save the uploaded file to a temporary location to be read by UnstructuredExcelLoader
     try:
@@ -102,18 +102,40 @@ def prepare_excel_data(uploaded_file, query, k=2):
         index = faiss.IndexFlatL2(dimension)
         index.add(doc_embeddings)
 
-        query_embedding = model.encode([query])
-        D, I = index.search(query_embedding, k=k)
-        retrieved_docs = [chunks[i].page_content for i in I[0]]
-
-        return rag(retrieved_docs, query)
+        return index, chunks
     except Exception as e:
-        st.error(f"An error occurred during Excel processing: {e}")
+        st.error(f"An error occurred during Excel database creation: {e}")
         return None
     finally:
         # Clean up the temporary file
         if os.path.exists("temp_excel_file.xlsx"):
             os.remove("temp_excel_file.xlsx")
+
+def prepare_excel_data(index: faiss.IndexFlatL2, chunks: list, query: str, k: int = 2):
+    """
+    Prepares Excel data for RAG by performing a similarity search on a pre-built
+    FAISS index and using the retrieved chunks with the RAG function.
+
+    Args:
+        index: The pre-built FAISS index.
+        chunks: A list of document chunks (langchain.schema.document.Document objects).
+        query: The user's query.
+        k: The number of most similar document chunks to retrieve (default is 2).
+
+    Returns:
+        str: The generated answer from the RAG function based on the retrieved chunks.
+    """
+    try:
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        query_embedding = model.encode([query])
+
+        D, I = index.search(query_embedding, k=k)
+        retrieved_docs = [chunks[i].page_content for i in I[0]]
+
+        return rag(retrieved_docs, query)
+    except Exception as e:
+        st.error(f"An error occurred during Excel data preparation: {e}")
+        return None
 
 def create_pdf_database(uploaded_file):
     """
@@ -205,8 +227,33 @@ if st.button("Get Answer"):
         file_extension = uploaded_file.name.split(".")[-1].lower()
 
         if file_extension == "xlsx":
-            with st.spinner("Processing Excel file..."):
-                answer = prepare_excel_data(uploaded_file, query, k_value)
+            # Create the database only once and store it in session state
+            if "excel_index" not in st.session_state or "excel_chunks" not in st.session_state or st.session_state.uploaded_excel_name != uploaded_file.name:
+                with st.spinner("Creating Excel database..."):
+                    result = create_excel_database(uploaded_file)
+                if result is not None:
+                    index, chunks = result
+                    st.session_state.excel_index = index
+                    st.session_state.excel_chunks = chunks
+                    st.session_state.uploaded_excel_name = uploaded_file.name
+                    st.success("Excel database created.")
+                else:
+                    st.error("Failed to create Excel database. Please try again.")
+                    # Clear session state if database creation failed
+                    if "excel_index" in st.session_state:
+                        del st.session_state.excel_index
+                    if "excel_chunks" in st.session_state:
+                        del st.session_state.excel_chunks
+                    if "uploaded_excel_name" in st.session_state:
+                        del st.session_state.uploaded_excel_name
+                    st.stop() # Stop execution after showing error
+            else:
+                index = st.session_state.excel_index
+                chunks = st.session_state.excel_chunks
+                st.info("Using existing Excel database.")
+
+            with st.spinner("Processing query..."):
+                answer = prepare_excel_data(index, chunks, query, k_value)
             if answer:
                 st.subheader("Answer:")
                 st.write(answer)
@@ -214,12 +261,13 @@ if st.button("Get Answer"):
             # Create the database only once and store it in session state
             if "pdf_index" not in st.session_state or "pdf_chunks" not in st.session_state or st.session_state.uploaded_pdf_name != uploaded_file.name:
                 with st.spinner("Creating PDF database..."):
-                    index, chunks = create_pdf_database(uploaded_file)
-                if index is not None and chunks is not None:
-                     st.session_state.pdf_index = index
-                     st.session_state.pdf_chunks = chunks
-                     st.session_state.uploaded_pdf_name = uploaded_file.name
-                     st.success("PDF database created.")
+                    result = create_pdf_database(uploaded_file)
+                if result is not None:
+                    index, chunks = result
+                    st.session_state.pdf_index = index
+                    st.session_state.pdf_chunks = chunks
+                    st.session_state.uploaded_pdf_name = uploaded_file.name
+                    st.success("PDF database created.")
                 else:
                     st.error("Failed to create PDF database. Please try again.")
                     # Clear session state if database creation failed
