@@ -100,30 +100,54 @@ def create_excel_database(uploaded_file):
         columns_info = cursor.fetchall()
         
         schema_parts = []
-        schema_parts.append("Database Schema:")
+        schema_parts.append("=== DATABASE SCHEMA ===")
         schema_parts.append("Table: data_table")
-        schema_parts.append("Columns:")
+        schema_parts.append("\nColumn Information:")
         
         for col_info in columns_info:
             col_name = col_info[1]
             col_type = col_info[2]
-            schema_parts.append(f"  - {col_name} ({col_type})")
+            not_null = "NOT NULL" if col_info[3] else "NULLABLE"
+            schema_parts.append(f"  • {col_name}: {col_type} ({not_null})")
         
-        # Add sample data
-        cursor.execute("SELECT * FROM data_table LIMIT 5")
+        # Add sample data with more detail
+        cursor.execute("SELECT * FROM data_table LIMIT 3")
         sample_data = cursor.fetchall()
-        
-        schema_parts.append("\nSample Data (first 5 rows):")
         column_names = [desc[0] for desc in cursor.description]
+        
+        schema_parts.append("\n=== SAMPLE DATA ===")
         schema_parts.append(f"Columns: {', '.join(column_names)}")
         
         for i, row in enumerate(sample_data, 1):
-            schema_parts.append(f"Row {i}: {row}")
+            row_dict = dict(zip(column_names, row))
+            schema_parts.append(f"Sample Row {i}: {row_dict}")
+        
+        # Add data type examples and unique values for categorical columns
+        schema_parts.append("\n=== DATA INSIGHTS ===")
+        
+        for col_name in column_names:
+            # Get unique value count
+            cursor.execute(f"SELECT COUNT(DISTINCT {col_name}) FROM data_table")
+            unique_count = cursor.fetchone()[0]
+            
+            # Get null count
+            cursor.execute(f"SELECT COUNT(*) FROM data_table WHERE {col_name} IS NULL")
+            null_count = cursor.fetchone()[0]
+            
+            schema_parts.append(f"  • {col_name}: {unique_count} unique values, {null_count} nulls")
+            
+            # If it's a categorical column (low unique count), show sample values
+            if unique_count <= 10 and unique_count > 1:
+                cursor.execute(f"SELECT DISTINCT {col_name} FROM data_table WHERE {col_name} IS NOT NULL LIMIT 5")
+                unique_values = [str(row[0]) for row in cursor.fetchall()]
+                schema_parts.append(f"    Sample values: {', '.join(unique_values)}")
         
         # Add total row count
         cursor.execute("SELECT COUNT(*) FROM data_table")
         total_rows = cursor.fetchone()[0]
-        schema_parts.append(f"\nTotal rows in database: {total_rows}")
+        schema_parts.append(f"\n=== SUMMARY ===")
+        schema_parts.append(f"Total rows: {total_rows}")
+        schema_parts.append(f"Total columns: {len(column_names)}")
         
         schema = "\n".join(schema_parts)
         
@@ -147,17 +171,7 @@ def prepare_excel_data(conn: sqlite3.Connection, schema: str, query: str, k: int
         str: The generated answer from the RAG function based on the SQL query results.
     """
     try:
-        # First, let the LLM generate an appropriate SQL query
-        context = f"""
-        You have access to a SQLite database with the following schema:
-        
-        {schema}
-        
-        Based on the user's question, you need to write a SQL query to retrieve relevant data.
-        Only respond with the SQL query, nothing else. Use proper SQL syntax for SQLite.
-        The table name is 'data_table'.
-        """
-
+        # Generate SQL query using LLM
         client = OpenAI(
             api_key=groq_api_key,
             base_url="https://api.groq.com/openai/v1"
@@ -166,8 +180,32 @@ def prepare_excel_data(conn: sqlite3.Connection, schema: str, query: str, k: int
         sql_response = client.chat.completions.create(
             model="meta-llama/llama-4-scout-17b-16e-instruct",
             messages=[
-                {"role": "system", "content": "You are a SQL expert. Generate only the SQL query needed to answer the user's question. Do not include any explanations or markdown formatting."},
-                {"role": "user", "content": f"{context}\n\nUser question: {query}\n\nSQL query:"}
+                {"role": "system", "content": """You are an expert SQL developer specializing in SQLite. Your task is to generate precise, efficient SQL queries.
+
+CRITICAL INSTRUCTIONS:
+- Return ONLY the SQL query, nothing else
+- No explanations, comments, or markdown formatting
+- Use proper SQLite syntax and functions
+- The table name is always 'data_table'
+- Be case-sensitive with column names as provided in the schema
+- Use appropriate SQLite data types and functions
+- For text searches, use LIKE with wildcards (%) when appropriate
+- For numerical operations, use proper arithmetic operators
+- For date/time operations, use SQLite date functions if needed
+
+QUERY REQUIREMENTS:
+- Write efficient queries that directly answer the user's question
+- Use appropriate WHERE clauses for filtering
+- Use GROUP BY and aggregate functions (COUNT, SUM, AVG, MAX, MIN) when needed
+- Use ORDER BY for sorting results when relevant
+- Use LIMIT only if the user specifically asks for a limited number of results
+- Handle NULL values appropriately"""},
+                {"role": "user", "content": f"""Database Schema and Context:
+{schema}
+
+User Question: {query}
+
+Generate the SQL query:"""}
             ],
             temperature=0.1
         )
@@ -208,18 +246,7 @@ def prepare_excel_data(conn: sqlite3.Connection, schema: str, query: str, k: int
         return f"Error executing query: {str(e)}"
 
 def create_pdf_database(uploaded_file):
-    """
-    Creates a FAISS database from an uploaded PDF file and returns the index and document chunks.
-
-    Args:
-        uploaded_file: The uploaded file object from Streamlit.
-
-    Returns:
-        A tuple containing:
-            - faiss.IndexFlatL2: The created FAISS index.
-            - list: A list of document chunks (langchain.schema.document.Document objects).
-        Returns None if an error occurs.
-    """
+    
     # Save the uploaded file to a temporary location
     try:
         with open("temp_pdf_file.pdf", "wb") as f:
@@ -251,19 +278,7 @@ def create_pdf_database(uploaded_file):
             os.remove("temp_pdf_file.pdf")
 
 def prepare_pdf_data(index: faiss.IndexFlatL2, chunks: list, query: str, k: int = 2):
-    """
-    Prepares PDF data for RAG by performing a similarity search on a pre-built
-    FAISS index and using the retrieved chunks with the RAG function.
-
-    Args:
-        index: The pre-built FAISS index.
-        chunks: A list of document chunks (langchain.schema.document.Document objects).
-        query: The user's query.
-        k: The number of most similar document chunks to retrieve (default is 2).
-
-    Returns:
-        str: The generated answer from the RAG function based on the retrieved chunks.
-    """
+    
     try:
         model = SentenceTransformer('all-MiniLM-L6-v2')
         query_embedding = model.encode([query])
