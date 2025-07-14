@@ -1,11 +1,14 @@
 import streamlit as st
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 import pandas as pd
 import faiss
 from openai import OpenAI
 import os # Import os to access environment variables
+import sqlite3
+import tempfile
 import sqlite3
 import tempfile
 
@@ -45,11 +48,15 @@ def rag(retrieved_docs, query):
         messages=[
             {"role": "system", "content": """
             You are a helpful and knowledgeable assistant. When answering questions, use the most relevant information from the provided context. Be concise, avoid speculation, and favor well-supported answers.
+            You are a helpful and knowledgeable assistant. When answering questions, use the most relevant information from the provided context. Be concise, avoid speculation, and favor well-supported answers.
 
+            For structured data (like database results), present the information clearly and highlight key findings. When dealing with mixed or contradictory information, acknowledge both sides.
             For structured data (like database results), present the information clearly and highlight key findings. When dealing with mixed or contradictory information, acknowledge both sides.
 
             If asked about specific data points, summarize the most relevant information. If asked for comparisons or analysis, emphasize the differences and similarities based on the data provided.
+            If asked about specific data points, summarize the most relevant information. If asked for comparisons or analysis, emphasize the differences and similarities based on the data provided.
 
+            Only answer questions using the data you have. Do not generate fictional content or hallucinate details not found in the context.
             Only answer questions using the data you have. Do not generate fictional content or hallucinate details not found in the context.
             """},
             {"role": "user", "content": f"""
@@ -73,12 +80,15 @@ def rag(retrieved_docs, query):
 def create_excel_database(uploaded_file):
     """
     Creates a SQLite database from an uploaded Excel file and returns the database connection and schema.
+    Creates a SQLite database from an uploaded Excel file and returns the database connection and schema.
 
     Args:
         uploaded_file: The uploaded file object from Streamlit.
 
     Returns:
         A tuple containing:
+            - sqlite3.Connection: The SQLite database connection.
+            - str: The database schema information.
             - sqlite3.Connection: The SQLite database connection.
             - str: The database schema information.
         Returns None if an error occurs.
@@ -157,7 +167,10 @@ def create_excel_database(uploaded_file):
         return None
 
 def prepare_excel_data(conn: sqlite3.Connection, schema: str, query: str, k: int = 2):
+def prepare_excel_data(conn: sqlite3.Connection, schema: str, query: str, k: int = 2):
     """
+    Prepares Excel data for RAG by executing SQL queries on the database
+    and using the results with the RAG function.
     Prepares Excel data for RAG by executing SQL queries on the database
     and using the results with the RAG function.
 
@@ -166,8 +179,13 @@ def prepare_excel_data(conn: sqlite3.Connection, schema: str, query: str, k: int
         schema: The database schema information.
         query: The user's natural language query.
         k: Not used for SQL-based approach, kept for compatibility.
+        conn: The SQLite database connection.
+        schema: The database schema information.
+        query: The user's natural language query.
+        k: Not used for SQL-based approach, kept for compatibility.
 
     Returns:
+        str: The generated answer from the RAG function based on the SQL query results.
         str: The generated answer from the RAG function based on the SQL query results.
     """
     try:
@@ -244,6 +262,7 @@ Generate the SQL query:"""}
     except Exception as e:
         st.error(f"An error occurred during Excel data preparation: {e}")
         return f"Error executing query: {str(e)}"
+        return f"Error executing query: {str(e)}"
 
 def create_pdf_database(uploaded_file):
     
@@ -314,9 +333,13 @@ if st.button("Get Answer"):
         if file_extension == "xlsx":
             # Create the database only once and store it in session state
             if "excel_conn" not in st.session_state or "excel_schema" not in st.session_state or st.session_state.uploaded_excel_name != uploaded_file.name:
+            if "excel_conn" not in st.session_state or "excel_schema" not in st.session_state or st.session_state.uploaded_excel_name != uploaded_file.name:
                 with st.spinner("Creating Excel database..."):
                     result = create_excel_database(uploaded_file)
                 if result is not None:
+                    conn, schema = result
+                    st.session_state.excel_conn = conn
+                    st.session_state.excel_schema = schema
                     conn, schema = result
                     st.session_state.excel_conn = conn
                     st.session_state.excel_schema = schema
@@ -329,15 +352,22 @@ if st.button("Get Answer"):
                         del st.session_state.excel_conn
                     if "excel_schema" in st.session_state:
                         del st.session_state.excel_schema
+                    if "excel_conn" in st.session_state:
+                        del st.session_state.excel_conn
+                    if "excel_schema" in st.session_state:
+                        del st.session_state.excel_schema
                     if "uploaded_excel_name" in st.session_state:
                         del st.session_state.uploaded_excel_name
                     st.stop() # Stop execution after showing error
             else:
                 conn = st.session_state.excel_conn
                 schema = st.session_state.excel_schema
+                conn = st.session_state.excel_conn
+                schema = st.session_state.excel_schema
                 st.info("Using existing Excel database.")
 
             with st.spinner("Processing query..."):
+                answer = prepare_excel_data(conn, schema, query, k_value)
                 answer = prepare_excel_data(conn, schema, query, k_value)
             if answer:
                 st.subheader("Answer:")
@@ -387,6 +417,12 @@ if st.button("Get Answer"):
 
 # Add a clear button
 if st.button("Clear"):
+    # Close database connections if they exist
+    if "excel_conn" in st.session_state:
+        try:
+            st.session_state.excel_conn.close()
+        except:
+            pass
     # Close database connections if they exist
     if "excel_conn" in st.session_state:
         try:
