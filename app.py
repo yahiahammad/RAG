@@ -8,8 +8,7 @@ from openai import OpenAI
 import os # Import os to access environment variables
 import sqlite3
 import tempfile
-import re
-import uuid
+from datetime import datetime
 
 # Placeholder for Groq API key loading
 # Use Streamlit secrets or environment variables for secure access
@@ -22,20 +21,82 @@ except KeyError:
     st.error("Groq API key not found. Please set the GROQ_API_KEY in Streamlit secrets.")
     st.stop() # Stop execution if the key is not found
 
+# Initialize session state for conversation history
+if "conversation_history" not in st.session_state:
+    st.session_state.conversation_history = []
 
-def cleanup_session_files():
-    """Clean up temporary files when session ends"""
-    if 'session_id' in st.session_state:
-        try:
-            session_files = [f"temp_excel_{st.session_state.session_id}.db"]
-            for file_path in session_files:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-        except:
-            pass
+# CSS for chat interface
+st.markdown("""
+<style>
+.chat-container {
+    max-height: 400px;
+    overflow-y: auto;
+    padding: 10px;
+    border: 1px solid #ddd;
+    border-radius: 10px;
+    background-color: #f9f9f9;
+    margin-bottom: 20px;
+}
+
+.user-message {
+    background-color: #007bff;
+    color: white;
+    padding: 10px 15px;
+    border-radius: 18px;
+    margin: 5px 0;
+    max-width: 70%;
+    margin-left: auto;
+    margin-right: 0;
+    display: block;
+    text-align: right;
+}
+
+.assistant-message {
+    background-color: #e9ecef;
+    color: #333;
+    padding: 10px 15px;
+    border-radius: 18px;
+    margin: 5px 0;
+    max-width: 70%;
+    margin-left: 0;
+    margin-right: auto;
+    display: block;
+}
+
+.timestamp {
+    font-size: 0.8em;
+    color: #666;
+    margin: 2px 0;
+}
+
+.message-wrapper {
+    margin: 10px 0;
+}
+
+.user-wrapper {
+    text-align: right;
+}
+
+.assistant-wrapper {
+    text-align: left;
+}
+</style>
+""", unsafe_allow_html=True)
+
 
 def rag(retrieved_docs, query, conversation_history=None):
-    
+    """
+    Performs Retrieval-Augmented Generation (RAG) using retrieved document chunks
+    and a user query to generate an answer, with optional conversation history.
+
+    Args:
+        retrieved_docs: A list of strings containing the content of retrieved document chunks.
+        query: The user's query string.
+        conversation_history: List of previous conversation messages.
+
+    Returns:
+        str: The generated answer from the language model.
+    """
     context = "\n".join(retrieved_docs)
 
     client = OpenAI(
@@ -43,7 +104,7 @@ def rag(retrieved_docs, query, conversation_history=None):
         base_url="https://api.groq.com/openai/v1"
     )
 
-    # Build the conversation messages
+    # Build conversation context
     messages = [
         {"role": "system", "content": """
         You are a helpful and knowledgeable assistant. When answering questions, use the most relevant information from the provided context. Be concise, avoid speculation, and favor well-supported answers.
@@ -54,29 +115,30 @@ def rag(retrieved_docs, query, conversation_history=None):
 
         Only answer questions using the data you have. Do not generate fictional content or hallucinate details not found in the context.
         
-        Consider the conversation history when answering follow-up questions, but always prioritize the current context data.
+        When the user asks follow-up questions, consider the conversation history to provide contextually relevant answers.
         """}
     ]
-
+    
     # Add conversation history if available
     if conversation_history:
-        messages.extend(conversation_history)
+        for msg in conversation_history[-6:]:  # Keep last 6 messages for context
+            if msg["role"] == "user":
+                messages.append({"role": "user", "content": msg["content"]})
+            else:
+                messages.append({"role": "assistant", "content": msg["content"]})
+    
+    # Add current query with context
+    messages.append({"role": "user", "content": f"""
+              Using the information in the following context, answer the question clearly and accurately.
 
-    # Add the current query with context
-    messages.append({
-        "role": "user", 
-        "content": f"""
-          Using the information in the following context, answer the question clearly and accurately.
+              Context:
+              {context}
 
-          Context:
-          {context}
+              Answer the following question:
+              {query}
 
-          Answer the following question:
-          {query}
-
-          If the answer cannot be found in the context, say The context does not contain enough information to answer this question. then explain why it does not contain enough information.
-        """
-    })
+              If the answer cannot be found in the context, say The context does not contain enough information to answer this question. then explain why it does not contain enough information.
+            """})
 
     response = client.chat.completions.create(
         model="meta-llama/llama-4-scout-17b-16e-instruct",
@@ -89,14 +151,14 @@ def rag(retrieved_docs, query, conversation_history=None):
 
 def create_excel_database(uploaded_file):
     """
-    Creates a SQLite database from an uploaded Excel file and returns the database path and schema.
+    Creates a SQLite database from an uploaded Excel file and returns the database connection and schema.
 
     Args:
         uploaded_file: The uploaded file object from Streamlit.
 
     Returns:
         A tuple containing:
-            - str: The path to the SQLite database file.
+            - sqlite3.Connection: The SQLite database connection.
             - str: The database schema information.
         Returns None if an error occurs.
     """
@@ -104,35 +166,12 @@ def create_excel_database(uploaded_file):
         # Read Excel file into pandas DataFrame
         df = pd.read_excel(uploaded_file)
         
-        # Clean column names to avoid SQL issues
-        df.columns = df.columns.astype(str)  # Convert to string
-        df.columns = [col.strip().replace(' ', '_').replace('-', '_').replace('.', '_') for col in df.columns]
-        
-        # Remove any special characters that might cause SQL issues
-        import re
-        df.columns = [re.sub(r'[^\w_]', '_', col) for col in df.columns]
-        
-        # Ensure column names don't start with numbers
-        df.columns = [f"col_{col}" if col[0].isdigit() else col for col in df.columns]
-        
-        # Create a temporary SQLite database with a unique name for this session
-        import uuid
-        session_id = st.session_state.get('session_id', str(uuid.uuid4()))
-        if 'session_id' not in st.session_state:
-            st.session_state.session_id = session_id
-        
-        temp_db_path = f"temp_excel_{session_id}.db"
-        
-        conn = sqlite3.connect(temp_db_path, check_same_thread=False)
+        # Create a temporary SQLite database
+        temp_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
+        conn = sqlite3.connect(temp_db.name)
         
         # Convert DataFrame to SQL table
         df.to_sql('data_table', conn, index=False, if_exists='replace')
-        
-        # Store the database path instead of the connection
-        conn.close()
-        
-        # Create a new connection for schema generation
-        conn = sqlite3.connect(temp_db_path, check_same_thread=False)
         
         # Generate schema information
         cursor = conn.cursor()
@@ -166,19 +205,19 @@ def create_excel_database(uploaded_file):
         schema_parts.append("\n=== DATA INSIGHTS ===")
         
         for col_name in column_names:
-            # Get unique value count - use quoted column names to handle special cases
-            cursor.execute(f'SELECT COUNT(DISTINCT "{col_name}") FROM data_table')
+            # Get unique value count
+            cursor.execute(f"SELECT COUNT(DISTINCT {col_name}) FROM data_table")
             unique_count = cursor.fetchone()[0]
             
             # Get null count
-            cursor.execute(f'SELECT COUNT(*) FROM data_table WHERE "{col_name}" IS NULL')
+            cursor.execute(f"SELECT COUNT(*) FROM data_table WHERE {col_name} IS NULL")
             null_count = cursor.fetchone()[0]
             
             schema_parts.append(f"  • {col_name}: {unique_count} unique values, {null_count} nulls")
             
             # If it's a categorical column (low unique count), show sample values
             if unique_count <= 10 and unique_count > 1:
-                cursor.execute(f'SELECT DISTINCT "{col_name}" FROM data_table WHERE "{col_name}" IS NOT NULL LIMIT 5')
+                cursor.execute(f"SELECT DISTINCT {col_name} FROM data_table WHERE {col_name} IS NOT NULL LIMIT 5")
                 unique_values = [str(row[0]) for row in cursor.fetchall()]
                 schema_parts.append(f"    Sample values: {', '.join(unique_values)}")
         
@@ -191,21 +230,18 @@ def create_excel_database(uploaded_file):
         
         schema = "\n".join(schema_parts)
         
-        conn.close()
-        
-        # Return the database path and schema instead of connection
-        return temp_db_path, schema
+        return conn, schema
     except Exception as e:
         st.error(f"An error occurred during Excel database creation: {e}")
         return None
 
-def prepare_excel_data(db_path: str, schema: str, query: str, k: int = 2):
+def prepare_excel_data(conn: sqlite3.Connection, schema: str, query: str, k: int = 2):
     """
     Prepares Excel data for RAG by executing SQL queries on the database
     and using the results with the RAG function.
 
     Args:
-        db_path: The path to the SQLite database file.
+        conn: The SQLite database connection.
         schema: The database schema information.
         query: The user's natural language query.
         k: Not used for SQL-based approach, kept for compatibility.
@@ -214,9 +250,6 @@ def prepare_excel_data(db_path: str, schema: str, query: str, k: int = 2):
         str: The generated answer from the RAG function based on the SQL query results.
     """
     try:
-        # Create a new connection for this thread
-        conn = sqlite3.connect(db_path, check_same_thread=False)
-        
         # Generate SQL query using LLM
         client = OpenAI(
             api_key=groq_api_key,
@@ -233,7 +266,7 @@ CRITICAL INSTRUCTIONS:
 - No explanations, comments, or markdown formatting
 - Use proper SQLite syntax and functions
 - The table name is always 'data_table'
-- ALWAYS use double quotes around column names to handle special characters (e.g., "column_name")
+- Be case-sensitive with column names as provided in the schema
 - Use appropriate SQLite data types and functions
 - For text searches, use LIKE with wildcards (%) when appropriate
 - For numerical operations, use proper arithmetic operators
@@ -245,14 +278,7 @@ QUERY REQUIREMENTS:
 - Use GROUP BY and aggregate functions (COUNT, SUM, AVG, MAX, MIN) when needed
 - Use ORDER BY for sorting results when relevant
 - Use LIMIT only if the user specifically asks for a limited number of results
-- Handle NULL values appropriately
-- Remember to quote ALL column names with double quotes
-
-EXAMPLES:
-- SELECT "Name", "Age" FROM data_table WHERE "Age" > 25
-- SELECT COUNT(*) FROM data_table WHERE "Status" = 'Active'
-- SELECT "Category", AVG("Price") FROM data_table GROUP BY "Category"
-"""},
+- Handle NULL values appropriately"""},
                 {"role": "user", "content": f"""Database Schema and Context:
 {schema}
 
@@ -279,9 +305,6 @@ Generate the SQL query:"""}
         cursor.execute(sql_query)
         results = cursor.fetchall()
         column_names = [description[0] for description in cursor.description]
-        
-        # Close the connection
-        conn.close()
 
         # Format the results for the RAG function
         if results:
@@ -295,21 +318,7 @@ Generate the SQL query:"""}
             result_text = f"SQL Query: {sql_query}\n\nNo results found."
 
         # Use RAG to generate a natural language answer
-        conversation_history = st.session_state.get('conversation_history', [])
-        answer = rag([result_text], query, conversation_history)
-        
-        # Update conversation history
-        if 'conversation_history' not in st.session_state:
-            st.session_state.conversation_history = []
-        
-        st.session_state.conversation_history.append({"role": "user", "content": query})
-        st.session_state.conversation_history.append({"role": "assistant", "content": answer})
-        
-        # Keep only the last 10 exchanges (20 messages) to prevent context from getting too long
-        if len(st.session_state.conversation_history) > 20:
-            st.session_state.conversation_history = st.session_state.conversation_history[-20:]
-        
-        return answer
+        return rag([result_text], query, st.session_state.conversation_history)
         
     except Exception as e:
         st.error(f"An error occurred during Excel data preparation: {e}")
@@ -356,161 +365,171 @@ def prepare_pdf_data(index: faiss.IndexFlatL2, chunks: list, query: str, k: int 
         D, I = index.search(query_embedding, k=k)
         retrieved_docs = [chunks[i].page_content for i in I[0]]
 
-        conversation_history = st.session_state.get('conversation_history', [])
-        answer = rag(retrieved_docs, query, conversation_history)
-        
-        # Update conversation history
-        if 'conversation_history' not in st.session_state:
-            st.session_state.conversation_history = []
-        
-        st.session_state.conversation_history.append({"role": "user", "content": query})
-        st.session_state.conversation_history.append({"role": "assistant", "content": answer})
-        
-        # Keep only the last 10 exchanges (20 messages) to prevent context from getting too long
-        if len(st.session_state.conversation_history) > 20:
-            st.session_state.conversation_history = st.session_state.conversation_history[-20:]
-        
-        return answer
+        return rag(retrieved_docs, query, st.session_state.conversation_history)
     except Exception as e:
         st.error(f"An error occurred during PDF data preparation: {e}")
         return None
 
+def add_to_conversation(role, content):
+    """Add a message to the conversation history."""
+    timestamp = datetime.now().strftime("%H:%M")
+    st.session_state.conversation_history.append({
+        "role": role,
+        "content": content,
+        "timestamp": timestamp
+    })
 
-st.title("RAG Application")
+def display_conversation():
+    """Display the conversation history in a chat-like interface."""
+    if st.session_state.conversation_history:
+        st.markdown('<div class="chat-container">', unsafe_allow_html=True)
+        
+        for message in st.session_state.conversation_history:
+            if message["role"] == "user":
+                st.markdown(f'''
+                <div class="message-wrapper user-wrapper">
+                    <div class="timestamp">{message["timestamp"]}</div>
+                    <div class="user-message">{message["content"]}</div>
+                </div>
+                ''', unsafe_allow_html=True)
+            else:
+                st.markdown(f'''
+                <div class="message-wrapper assistant-wrapper">
+                    <div class="timestamp">{message["timestamp"]}</div>
+                    <div class="assistant-message">{message["content"]}</div>
+                </div>
+                ''', unsafe_allow_html=True)
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+    else:
+        st.info("No conversation history yet. Ask your first question!")
 
-# Clean up any leftover temporary files from previous sessions
-cleanup_session_files()
+def clear_conversation():
+    """Clear the conversation history."""
+    st.session_state.conversation_history = []
 
-st.write("Upload a document (Excel or PDF) and ask questions about its content.")
 
-# Display conversation history if it exists
-if 'conversation_history' in st.session_state and st.session_state.conversation_history:
-    with st.expander("💬 Conversation History", expanded=False):
-        for i in range(0, len(st.session_state.conversation_history), 2):
-            if i + 1 < len(st.session_state.conversation_history):
-                user_msg = st.session_state.conversation_history[i]
-                assistant_msg = st.session_state.conversation_history[i + 1]
-                
-                st.write(f"**Q{(i//2)+1}:** {user_msg['content']}")
-                st.write(f"**A{(i//2)+1}:** {assistant_msg['content']}")
-                st.write("---")
+st.title("🤖 RAG Chat Application")
 
-# Layout using columns
-col1, col2 = st.columns([2, 1])
+st.write("Upload a document (Excel or PDF) and have a conversation about its content.")
 
-with col1:
-    uploaded_file = st.file_uploader("Choose a file", type=["xlsx", "pdf"])
-    query = st.text_input("Enter your query:")
+# File upload section
+uploaded_file = st.file_uploader("Choose a file", type=["xlsx", "pdf"])
 
-with col2:
+# Settings sidebar
+with st.sidebar:
+    st.header("Settings")
     k_value = st.slider("Number of relevant documents to retrieve (k)", 1, 10, 2)
     
-    # Add a button to clear conversation history
-    if st.button("Clear Chat History"):
-        if 'conversation_history' in st.session_state:
-            st.session_state.conversation_history = []
-            st.success("Chat history cleared!")
-            st.rerun()
+    if st.button("🗑️ Clear Conversation"):
+        clear_conversation()
+        st.rerun()
+    
+    if st.button("🔄 Clear All Data"):
+        # Close database connections if they exist
+        if "excel_conn" in st.session_state:
+            try:
+                st.session_state.excel_conn.close()
+            except:
+                pass
+        # Clear the session state and rerun the app to reset
+        st.session_state.clear()
+        st.rerun()
 
-# Add a button to trigger the RAG process
-if st.button("Get Answer"):
-    if uploaded_file is not None and query:
-        file_extension = uploaded_file.name.split(".")[-1].lower()
+# Display conversation history
+st.subheader("💬 Conversation")
+display_conversation()
 
-        if file_extension == "xlsx":
-            # Create the database only once and store it in session state
-            if "excel_db_path" not in st.session_state or "excel_schema" not in st.session_state or st.session_state.uploaded_excel_name != uploaded_file.name:
-                with st.spinner("Creating Excel database..."):
-                    result = create_excel_database(uploaded_file)
-                if result is not None:
-                    db_path, schema = result
-                    st.session_state.excel_db_path = db_path
-                    st.session_state.excel_schema = schema
-                    st.session_state.uploaded_excel_name = uploaded_file.name
-                    st.success("Excel database created.")
+# Chat input section
+if uploaded_file is not None:
+    # Show file info
+    file_extension = uploaded_file.name.split(".")[-1].lower()
+    st.info(f"📄 File loaded: {uploaded_file.name} ({file_extension.upper()})")
+    
+    # Text input for queries
+    query = st.text_input("Ask a question about your document:", key="query_input", placeholder="Type your question here...")
+    
+    # Process query when Enter is pressed or button is clicked
+    if st.button("Send 📤") or query:
+        if query.strip():
+            # Add user message to conversation
+            add_to_conversation("user", query)
+            
+            # Process the query based on file type
+            with st.spinner("🔍 Processing your question..."):
+                answer = None
+                
+                if file_extension == "xlsx":
+                    # Create the database only once and store it in session state
+                    if "excel_conn" not in st.session_state or "excel_schema" not in st.session_state or st.session_state.get("uploaded_excel_name") != uploaded_file.name:
+                        with st.spinner("📊 Creating Excel database..."):
+                            result = create_excel_database(uploaded_file)
+                        if result is not None:
+                            conn, schema = result
+                            st.session_state.excel_conn = conn
+                            st.session_state.excel_schema = schema
+                            st.session_state.uploaded_excel_name = uploaded_file.name
+                        else:
+                            st.error("Failed to create Excel database. Please try again.")
+                            st.stop()
+                    else:
+                        conn = st.session_state.excel_conn
+                        schema = st.session_state.excel_schema
+                    
+                    answer = prepare_excel_data(conn, schema, query, k_value)
+                    
+                elif file_extension == "pdf":
+                    # Create the database only once and store it in session state
+                    if "pdf_index" not in st.session_state or "pdf_chunks" not in st.session_state or st.session_state.get("uploaded_pdf_name") != uploaded_file.name:
+                        with st.spinner("📑 Creating PDF database..."):
+                            result = create_pdf_database(uploaded_file)
+                        if result is not None:
+                            index, chunks = result
+                            st.session_state.pdf_index = index
+                            st.session_state.pdf_chunks = chunks
+                            st.session_state.uploaded_pdf_name = uploaded_file.name
+                        else:
+                            st.error("Failed to create PDF database. Please try again.")
+                            st.stop()
+                    else:
+                        index = st.session_state.pdf_index
+                        chunks = st.session_state.pdf_chunks
+                    
+                    answer = prepare_pdf_data(index, chunks, query, k_value)
+                
                 else:
-                    st.error("Failed to create Excel database. Please try again.")
-                    # Clear session state if database creation failed
-                    if "excel_db_path" in st.session_state:
-                        del st.session_state.excel_db_path
-                    if "excel_schema" in st.session_state:
-                        del st.session_state.excel_schema
-                    if "uploaded_excel_name" in st.session_state:
-                        del st.session_state.uploaded_excel_name
-                    st.stop() # Stop execution after showing error
-            else:
-                db_path = st.session_state.excel_db_path
-                schema = st.session_state.excel_schema
-                st.info("Using existing Excel database.")
-
-            with st.spinner("Processing query..."):
-                answer = prepare_excel_data(db_path, schema, query, k_value)
+                    st.error("Unsupported file type.")
+                    answer = None
+            
+            # Add assistant response to conversation
             if answer:
-                st.subheader("Answer:")
-                st.write(answer)
-        elif file_extension == "pdf":
-            # Create the database only once and store it in session state
-            if "pdf_index" not in st.session_state or "pdf_chunks" not in st.session_state or st.session_state.uploaded_pdf_name != uploaded_file.name:
-                with st.spinner("Creating PDF database..."):
-                    result = create_pdf_database(uploaded_file)
-                if result is not None:
-                    index, chunks = result
-                    st.session_state.pdf_index = index
-                    st.session_state.pdf_chunks = chunks
-                    st.session_state.uploaded_pdf_name = uploaded_file.name
-                    st.success("PDF database created.")
-                else:
-                    st.error("Failed to create PDF database. Please try again.")
-                    # Clear session state if database creation failed
-                    if "pdf_index" in st.session_state:
-                        del st.session_state.pdf_index
-                    if "pdf_chunks" in st.session_state:
-                        del st.session_state.pdf_chunks
-                    if "uploaded_pdf_name" in st.session_state:
-                        del st.session_state.uploaded_pdf_name
-                    st.stop() # Stop execution after showing error
-
-
+                add_to_conversation("assistant", answer)
+                st.rerun()  # Refresh to show new messages
             else:
-                 index = st.session_state.pdf_index
-                 chunks = st.session_state.pdf_chunks
-                 st.info("Using existing PDF database.")
-
-
-            with st.spinner("Processing query..."):
-                answer = prepare_pdf_data(index, chunks, query, k_value)
-            if answer:
-                st.subheader("Answer:")
-                st.write(answer)
+                st.error("Failed to get an answer. Please try again.")
         else:
-            st.error("Unsupported file type.")
-    elif uploaded_file is None and query:
-        st.warning("Please upload a file.")
-    elif uploaded_file is not None and not query:
-         st.warning("Please enter a query.")
-    else:
-        st.warning("Please upload a file and enter a query.")
+            st.warning("Please enter a question.")
+else:
+    st.info("👆 Please upload a file to start the conversation.")
 
-# Add a clear button
-if st.button("Clear"):
-    # Clean up database files if they exist
-    if "excel_db_path" in st.session_state:
-        try:
-            if os.path.exists(st.session_state.excel_db_path):
-                os.remove(st.session_state.excel_db_path)
-        except:
-            pass
+# Add some helpful tips
+with st.expander("💡 Tips for better conversations"):
+    st.markdown("""
+    - **Follow-up questions**: Ask related questions to dive deeper into the content
+    - **Be specific**: The more specific your question, the better the answer
+    - **Reference previous answers**: You can refer to previous parts of the conversation
+    - **Excel files**: Ask about data analysis, calculations, trends, and comparisons
+    - **PDF files**: Ask about specific content, summaries, and detailed explanations
+    - **Use natural language**: Ask questions as you would to a human assistant
+    """)
+
+# Display file status
+if uploaded_file is not None:
+    file_extension = uploaded_file.name.split(".")[-1].lower()
     
-    # Clean up any session-specific temporary files
-    if 'session_id' in st.session_state:
-        try:
-            session_files = [f"temp_excel_{st.session_state.session_id}.db"]
-            for file_path in session_files:
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-        except:
-            pass
-    
-    # Clear the session state and rerun the app to reset
-    st.session_state.clear()
-    st.rerun()
+    if file_extension == "xlsx" and "excel_conn" in st.session_state:
+        st.success("✅ Excel database ready for queries")
+    elif file_extension == "pdf" and "pdf_index" in st.session_state:
+        st.success("✅ PDF database ready for queries")
+    else:
+        st.info("⏳ Database will be created when you ask your first question")
