@@ -184,12 +184,52 @@ def create_excel_database(uploaded_file):
         sql_keywords = {'name', 'order', 'group', 'select', 'from', 'where', 'table', 'column', 'index', 'key', 'primary', 'foreign', 'unique', 'null', 'not', 'and', 'or', 'in', 'is', 'like', 'between', 'exists', 'all', 'any', 'some', 'union', 'intersect', 'except', 'join', 'inner', 'outer', 'left', 'right', 'full', 'cross', 'natural', 'on', 'using', 'case', 'when', 'then', 'else', 'end', 'if', 'count', 'sum', 'avg', 'min', 'max', 'distinct', 'having', 'limit', 'offset', 'create', 'alter', 'drop', 'insert', 'update', 'delete', 'truncate', 'begin', 'commit', 'rollback', 'transaction', 'savepoint', 'release', 'grant', 'revoke', 'references', 'constraint', 'check', 'default', 'collate', 'autoincrement', 'temporary', 'temp', 'view', 'trigger', 'procedure', 'function', 'database', 'schema', 'pragma', 'explain', 'analyze', 'vacuum', 'reindex', 'attach', 'detach', 'conflict', 'fail', 'ignore', 'replace', 'abort', 'rollback', 'cascade', 'restrict', 'set', 'immediate', 'deferred', 'exclusive', 'shared', 'reserved', 'pending', 'unlocked'}
         df.columns = ['col_' + col if col.lower() in sql_keywords else col for col in df.columns]
         
+        # Ensure all column names are unique
+        seen = set()
+        new_columns = []
+        for col in df.columns:
+            original_col = col
+            counter = 1
+            while col in seen:
+                col = f"{original_col}_{counter}"
+                counter += 1
+            seen.add(col)
+            new_columns.append(col)
+        df.columns = new_columns
+        
         # Create a temporary SQLite database
         temp_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
         conn = sqlite3.connect(temp_db.name)
         
+        # Debug: Show the column transformation
+        st.info(f"Debug: Original columns: {original_columns}")
+        st.info(f"Debug: Cleaned columns: {df.columns.tolist()}")
+        
         # Convert DataFrame to SQL table
-        df.to_sql('data_table', conn, index=False, if_exists='replace')
+        try:
+            df.to_sql('data_table', conn, index=False, if_exists='replace')
+        except Exception as sql_error:
+            st.warning(f"Initial database creation failed: {sql_error}")
+            st.info("Attempting with safer column names...")
+            
+            # Fallback: Use generic column names
+            df.columns = [f'column_{i}' for i in range(len(df.columns))]
+            try:
+                df.to_sql('data_table', conn, index=False, if_exists='replace')
+                st.success("Database created with generic column names")
+            except Exception as fallback_error:
+                st.error(f"Fallback database creation also failed: {fallback_error}")
+                return None
+        
+        # Test the database by running a simple query
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT COUNT(*) FROM data_table")
+            row_count = cursor.fetchone()[0]
+            st.success(f"Database created successfully with {row_count} rows")
+        except Exception as test_error:
+            st.error(f"Database creation test failed: {test_error}")
+            return None
         
         # Generate schema information
         cursor = conn.cursor()
@@ -207,7 +247,12 @@ def create_excel_database(uploaded_file):
             col_type = col_info[2]
             not_null = "NOT NULL" if col_info[3] else "NULLABLE"
             original_name = original_columns[i] if i < len(original_columns) else col_name
-            schema_parts.append(f'  • "{col_name}" (originally: "{original_name}"): {col_type} ({not_null})')
+            
+            # Show different info based on whether we used generic names
+            if col_name.startswith('column_'):
+                schema_parts.append(f'  • "{col_name}" (originally: "{original_name}"): {col_type} ({not_null})')
+            else:
+                schema_parts.append(f'  • "{col_name}" (originally: "{original_name}"): {col_type} ({not_null})')
         
         # Add sample data with more detail
         cursor.execute("SELECT * FROM data_table LIMIT 3")
@@ -225,21 +270,25 @@ def create_excel_database(uploaded_file):
         schema_parts.append("\n=== DATA INSIGHTS ===")
         
         for col_name in column_names:
-            # Get unique value count with proper escaping
-            cursor.execute(f'SELECT COUNT(DISTINCT "{col_name}") FROM data_table')
-            unique_count = cursor.fetchone()[0]
-            
-            # Get null count with proper escaping
-            cursor.execute(f'SELECT COUNT(*) FROM data_table WHERE "{col_name}" IS NULL')
-            null_count = cursor.fetchone()[0]
-            
-            schema_parts.append(f"  • {col_name}: {unique_count} unique values, {null_count} nulls")
-            
-            # If it's a categorical column (low unique count), show sample values
-            if unique_count <= 10 and unique_count > 1:
-                cursor.execute(f'SELECT DISTINCT "{col_name}" FROM data_table WHERE "{col_name}" IS NOT NULL LIMIT 5')
-                unique_values = [str(row[0]) for row in cursor.fetchall()]
-                schema_parts.append(f"    Sample values: {', '.join(unique_values)}")
+            try:
+                # Get unique value count with proper escaping
+                cursor.execute(f'SELECT COUNT(DISTINCT "{col_name}") FROM data_table')
+                unique_count = cursor.fetchone()[0]
+                
+                # Get null count with proper escaping
+                cursor.execute(f'SELECT COUNT(*) FROM data_table WHERE "{col_name}" IS NULL')
+                null_count = cursor.fetchone()[0]
+                
+                schema_parts.append(f"  • {col_name}: {unique_count} unique values, {null_count} nulls")
+                
+                # If it's a categorical column (low unique count), show sample values
+                if unique_count <= 10 and unique_count > 1:
+                    cursor.execute(f'SELECT DISTINCT "{col_name}" FROM data_table WHERE "{col_name}" IS NOT NULL LIMIT 5')
+                    unique_values = [str(row[0]) for row in cursor.fetchall()]
+                    schema_parts.append(f"    Sample values: {', '.join(unique_values)}")
+            except Exception as col_error:
+                schema_parts.append(f"  • {col_name}: Error analyzing column - {str(col_error)}")
+                # Continue with other columns even if one fails
         
         # Add total row count
         cursor.execute("SELECT COUNT(*) FROM data_table")
