@@ -9,6 +9,7 @@ import os # Import os to access environment variables
 import sqlite3
 import tempfile
 import re
+import uuid
 
 # Placeholder for Groq API key loading
 # Use Streamlit secrets or environment variables for secure access
@@ -21,6 +22,17 @@ except KeyError:
     st.error("Groq API key not found. Please set the GROQ_API_KEY in Streamlit secrets.")
     st.stop() # Stop execution if the key is not found
 
+
+def cleanup_session_files():
+    """Clean up temporary files when session ends"""
+    if 'session_id' in st.session_state:
+        try:
+            session_files = [f"temp_excel_{st.session_state.session_id}.db"]
+            for file_path in session_files:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+        except:
+            pass
 
 def rag(retrieved_docs, query, conversation_history=None):
     
@@ -77,14 +89,14 @@ def rag(retrieved_docs, query, conversation_history=None):
 
 def create_excel_database(uploaded_file):
     """
-    Creates a SQLite database from an uploaded Excel file and returns the database connection and schema.
+    Creates a SQLite database from an uploaded Excel file and returns the database path and schema.
 
     Args:
         uploaded_file: The uploaded file object from Streamlit.
 
     Returns:
         A tuple containing:
-            - sqlite3.Connection: The SQLite database connection.
+            - str: The path to the SQLite database file.
             - str: The database schema information.
         Returns None if an error occurs.
     """
@@ -103,12 +115,24 @@ def create_excel_database(uploaded_file):
         # Ensure column names don't start with numbers
         df.columns = [f"col_{col}" if col[0].isdigit() else col for col in df.columns]
         
-        # Create a temporary SQLite database
-        temp_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
-        conn = sqlite3.connect(temp_db.name)
+        # Create a temporary SQLite database with a unique name for this session
+        import uuid
+        session_id = st.session_state.get('session_id', str(uuid.uuid4()))
+        if 'session_id' not in st.session_state:
+            st.session_state.session_id = session_id
+        
+        temp_db_path = f"temp_excel_{session_id}.db"
+        
+        conn = sqlite3.connect(temp_db_path, check_same_thread=False)
         
         # Convert DataFrame to SQL table
         df.to_sql('data_table', conn, index=False, if_exists='replace')
+        
+        # Store the database path instead of the connection
+        conn.close()
+        
+        # Create a new connection for schema generation
+        conn = sqlite3.connect(temp_db_path, check_same_thread=False)
         
         # Generate schema information
         cursor = conn.cursor()
@@ -167,18 +191,21 @@ def create_excel_database(uploaded_file):
         
         schema = "\n".join(schema_parts)
         
-        return conn, schema
+        conn.close()
+        
+        # Return the database path and schema instead of connection
+        return temp_db_path, schema
     except Exception as e:
         st.error(f"An error occurred during Excel database creation: {e}")
         return None
 
-def prepare_excel_data(conn: sqlite3.Connection, schema: str, query: str, k: int = 2):
+def prepare_excel_data(db_path: str, schema: str, query: str, k: int = 2):
     """
     Prepares Excel data for RAG by executing SQL queries on the database
     and using the results with the RAG function.
 
     Args:
-        conn: The SQLite database connection.
+        db_path: The path to the SQLite database file.
         schema: The database schema information.
         query: The user's natural language query.
         k: Not used for SQL-based approach, kept for compatibility.
@@ -187,6 +214,9 @@ def prepare_excel_data(conn: sqlite3.Connection, schema: str, query: str, k: int
         str: The generated answer from the RAG function based on the SQL query results.
     """
     try:
+        # Create a new connection for this thread
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        
         # Generate SQL query using LLM
         client = OpenAI(
             api_key=groq_api_key,
@@ -249,6 +279,9 @@ Generate the SQL query:"""}
         cursor.execute(sql_query)
         results = cursor.fetchall()
         column_names = [description[0] for description in cursor.description]
+        
+        # Close the connection
+        conn.close()
 
         # Format the results for the RAG function
         if results:
@@ -345,6 +378,9 @@ def prepare_pdf_data(index: faiss.IndexFlatL2, chunks: list, query: str, k: int 
 
 st.title("RAG Application")
 
+# Clean up any leftover temporary files from previous sessions
+cleanup_session_files()
+
 st.write("Upload a document (Excel or PDF) and ask questions about its content.")
 
 # Display conversation history if it exists
@@ -383,32 +419,32 @@ if st.button("Get Answer"):
 
         if file_extension == "xlsx":
             # Create the database only once and store it in session state
-            if "excel_conn" not in st.session_state or "excel_schema" not in st.session_state or st.session_state.uploaded_excel_name != uploaded_file.name:
+            if "excel_db_path" not in st.session_state or "excel_schema" not in st.session_state or st.session_state.uploaded_excel_name != uploaded_file.name:
                 with st.spinner("Creating Excel database..."):
                     result = create_excel_database(uploaded_file)
                 if result is not None:
-                    conn, schema = result
-                    st.session_state.excel_conn = conn
+                    db_path, schema = result
+                    st.session_state.excel_db_path = db_path
                     st.session_state.excel_schema = schema
                     st.session_state.uploaded_excel_name = uploaded_file.name
                     st.success("Excel database created.")
                 else:
                     st.error("Failed to create Excel database. Please try again.")
                     # Clear session state if database creation failed
-                    if "excel_conn" in st.session_state:
-                        del st.session_state.excel_conn
+                    if "excel_db_path" in st.session_state:
+                        del st.session_state.excel_db_path
                     if "excel_schema" in st.session_state:
                         del st.session_state.excel_schema
                     if "uploaded_excel_name" in st.session_state:
                         del st.session_state.uploaded_excel_name
                     st.stop() # Stop execution after showing error
             else:
-                conn = st.session_state.excel_conn
+                db_path = st.session_state.excel_db_path
                 schema = st.session_state.excel_schema
                 st.info("Using existing Excel database.")
 
             with st.spinner("Processing query..."):
-                answer = prepare_excel_data(conn, schema, query, k_value)
+                answer = prepare_excel_data(db_path, schema, query, k_value)
             if answer:
                 st.subheader("Answer:")
                 st.write(answer)
@@ -457,12 +493,24 @@ if st.button("Get Answer"):
 
 # Add a clear button
 if st.button("Clear"):
-    # Close database connections if they exist
-    if "excel_conn" in st.session_state:
+    # Clean up database files if they exist
+    if "excel_db_path" in st.session_state:
         try:
-            st.session_state.excel_conn.close()
+            if os.path.exists(st.session_state.excel_db_path):
+                os.remove(st.session_state.excel_db_path)
         except:
             pass
+    
+    # Clean up any session-specific temporary files
+    if 'session_id' in st.session_state:
+        try:
+            session_files = [f"temp_excel_{st.session_state.session_id}.db"]
+            for file_path in session_files:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+        except:
+            pass
+    
     # Clear the session state and rerun the app to reset
     st.session_state.clear()
     st.rerun()
