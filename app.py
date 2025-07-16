@@ -527,12 +527,12 @@ if uploaded_file is not None:
     file_extension = uploaded_file.name.split(".")[-1].lower()
     st.info(f"📄 File loaded: {uploaded_file.name} ({file_extension.upper()})")
     
-    # Text input for queries
-    query = st.text_input("Ask a question about your document:", key="query_input", placeholder="Type your question here...")
-    
-    # Process query when Enter is pressed or button is clicked
-    if st.button("Send 📤") or query:
-        if query.strip():
+    # Text input for queries using form to prevent infinite loops
+    with st.form("query_form", clear_on_submit=True):
+        query = st.text_input("Ask a question about your document:", placeholder="Type your question here...")
+        submitted = st.form_submit_button("Send 📤")
+        
+        if submitted and query.strip():
             # Add user message to conversation
             add_to_conversation("user", query)
             
@@ -588,7 +588,7 @@ if uploaded_file is not None:
                 st.rerun()  # Refresh to show new messages
             else:
                 st.error("Failed to get an answer. Please try again.")
-        else:
+        elif submitted and not query.strip():
             st.warning("Please enter a question.")
 else:
     st.info("👆 Please upload a file to start the conversation.")
