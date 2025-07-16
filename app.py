@@ -144,14 +144,17 @@ def rag(retrieved_docs, query, conversation_history=None):
               If the answer cannot be found in the context, say The context does not contain enough information to answer this question. then explain why it does not contain enough information.
             """})
 
-    response = client.chat.completions.create(
-        model="meta-llama/llama-4-scout-17b-16e-instruct",
-        messages=messages,
-        temperature=0.7
-    )
-
-    answer = response.choices[0].message.content
-    return answer # Return the answer string
+    try:
+        response = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=messages,
+            temperature=0.7
+        )
+        answer = response.choices[0].message.content
+        return answer
+    except Exception as e:
+        st.error(f"Error generating response: {str(e)}")
+        return "I apologize, but I encountered an error while processing your question. Please try again."
 
 def create_excel_database(uploaded_file):
     """
@@ -210,24 +213,16 @@ def create_excel_database(uploaded_file):
         
         conn = sqlite3.connect(db_path, check_same_thread=False)
         
-        # Debug: Show the column transformation
-        st.info(f"Debug: Original columns: {original_columns}")
-        st.info(f"Debug: Cleaned columns: {df.columns.tolist()}")
-        
         # Convert DataFrame to SQL table
         try:
             df.to_sql('data_table', conn, index=False, if_exists='replace')
         except Exception as sql_error:
-            st.warning(f"Initial database creation failed: {sql_error}")
-            st.info("Attempting with safer column names...")
-            
             # Fallback: Use generic column names
             df.columns = [f'column_{i}' for i in range(len(df.columns))]
             try:
                 df.to_sql('data_table', conn, index=False, if_exists='replace')
-                st.success("Database created with generic column names")
             except Exception as fallback_error:
-                st.error(f"Fallback database creation also failed: {fallback_error}")
+                st.error(f"Failed to create database: {fallback_error}")
                 conn.close()
                 return None
         
@@ -236,7 +231,10 @@ def create_excel_database(uploaded_file):
         try:
             cursor.execute("SELECT COUNT(*) FROM data_table")
             row_count = cursor.fetchone()[0]
-            st.success(f"Database created successfully with {row_count} rows")
+            if row_count == 0:
+                st.warning("The Excel file appears to be empty or contains no data rows.")
+                conn.close()
+                return None
         except Exception as test_error:
             st.error(f"Database creation test failed: {test_error}")
             conn.close()
@@ -316,8 +314,6 @@ def create_excel_database(uploaded_file):
         return db_path, schema
     except Exception as e:
         st.error(f"An error occurred during Excel database creation: {e}")
-        import traceback
-        st.error(f"Detailed error: {traceback.format_exc()}")
         return None
 
 def prepare_excel_data(db_path: str, schema: str, query: str, k: int = 2):
@@ -349,10 +345,11 @@ def prepare_excel_data(db_path: str, schema: str, query: str, k: int = 2):
             for msg in recent_messages:
                 conversation_context += f"{msg['role'].title()}: {msg['content']}\n"
 
-        sql_response = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
-            messages=[
-                {"role": "system", "content": """You are an expert SQL developer specializing in SQLite. Your task is to generate precise, efficient SQL queries.
+        try:
+            sql_response = client.chat.completions.create(
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
+                messages=[
+                    {"role": "system", "content": """You are an expert SQL developer specializing in SQLite. Your task is to generate precise, efficient SQL queries.
 
 CRITICAL INSTRUCTIONS:
 - Return ONLY the SQL query, nothing else
@@ -382,7 +379,7 @@ FOLLOW-UP QUESTIONS:
 EXAMPLE:
 Instead of: SELECT Name, Age FROM data_table
 Use: SELECT "Name", "Age" FROM data_table"""},
-                {"role": "user", "content": f"""Database Schema and Context:
+                    {"role": "user", "content": f"""Database Schema and Context:
 {schema}
 
 {conversation_context}
@@ -390,11 +387,13 @@ Use: SELECT "Name", "Age" FROM data_table"""},
 User Question: {query}
 
 Generate the SQL query (remember to wrap all column names in double quotes):"""}
-            ],
-            temperature=0.1
-        )
-
-        sql_query = sql_response.choices[0].message.content.strip()
+                ],
+                temperature=0.1
+            )
+            sql_query = sql_response.choices[0].message.content.strip()
+        except Exception as api_error:
+            st.error(f"Error generating SQL query: {str(api_error)}")
+            return "I apologize, but I encountered an error while processing your question. Please try again."
         
         # Clean up the SQL query (remove any markdown formatting)
         if sql_query.startswith("```sql"):
@@ -415,7 +414,6 @@ Generate the SQL query (remember to wrap all column names in double quotes):"""}
             column_names = [description[0] for description in cursor.description]
         except sqlite3.Error as sql_error:
             st.error(f"SQL execution error: {sql_error}")
-            st.error(f"Generated SQL query: {sql_query}")
             return f"Error executing SQL query: {str(sql_error)}"
         finally:
             conn.close()  # Always close the connection
@@ -429,7 +427,7 @@ Generate the SQL query (remember to wrap all column names in double quotes):"""}
                 row_data = dict(zip(column_names, row))
                 result_text += f"Row {i}: {row_data}\n"
         else:
-            result_text = f"SQL Query: {sql_query}\n\nNo results found."
+            result_text = f"SQL Query: {sql_query}\n\nNo results found for this query."
 
         # Use RAG to generate a natural language answer
         return rag([result_text], query, st.session_state.conversation_history)
@@ -543,7 +541,6 @@ with st.sidebar:
         # Clean up database file if it exists
         if "excel_db_path" in st.session_state:
             try:
-                import os
                 if os.path.exists(st.session_state.excel_db_path):
                     os.remove(st.session_state.excel_db_path)
             except:
@@ -578,7 +575,7 @@ if uploaded_file is not None:
                 if file_extension == "xlsx":
                     # Create the database only once and store it in session state
                     if "excel_db_path" not in st.session_state or "excel_schema" not in st.session_state or st.session_state.get("uploaded_excel_name") != uploaded_file.name:
-                        with st.spinner("📊 Creating Excel database..."):
+                        with st.spinner("📊 Processing Excel file..."):
                             result = create_excel_database(uploaded_file)
                         if result is not None:
                             db_path, schema = result
@@ -586,7 +583,7 @@ if uploaded_file is not None:
                             st.session_state.excel_schema = schema
                             st.session_state.uploaded_excel_name = uploaded_file.name
                         else:
-                            st.error("Failed to create Excel database. Please try again.")
+                            st.error("Failed to process Excel file. Please check the file format and try again.")
                             st.stop()
                     else:
                         db_path = st.session_state.excel_db_path
@@ -597,7 +594,7 @@ if uploaded_file is not None:
                 elif file_extension == "pdf":
                     # Create the database only once and store it in session state
                     if "pdf_index" not in st.session_state or "pdf_chunks" not in st.session_state or st.session_state.get("uploaded_pdf_name") != uploaded_file.name:
-                        with st.spinner("📑 Creating PDF database..."):
+                        with st.spinner("📑 Processing PDF file..."):
                             result = create_pdf_database(uploaded_file)
                         if result is not None:
                             index, chunks = result
@@ -605,7 +602,7 @@ if uploaded_file is not None:
                             st.session_state.pdf_chunks = chunks
                             st.session_state.uploaded_pdf_name = uploaded_file.name
                         else:
-                            st.error("Failed to create PDF database. Please try again.")
+                            st.error("Failed to process PDF file. Please check the file format and try again.")
                             st.stop()
                     else:
                         index = st.session_state.pdf_index
@@ -644,8 +641,12 @@ if uploaded_file is not None:
     file_extension = uploaded_file.name.split(".")[-1].lower()
     
     if file_extension == "xlsx" and "excel_db_path" in st.session_state:
-        st.success("✅ Excel database ready for queries")
+        st.success("✅ Excel file ready for queries")
     elif file_extension == "pdf" and "pdf_index" in st.session_state:
-        st.success("✅ PDF database ready for queries")
+        st.success("✅ PDF file ready for queries")
     else:
-        st.info("⏳ Database will be created when you ask your first question")
+        st.info("⏳ File will be processed when you ask your first question")
+
+# Footer
+st.markdown("---")
+st.markdown("**Note**: This application supports Excel (.xlsx) and PDF files. Your data is processed locally and not stored permanently.")
