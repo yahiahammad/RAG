@@ -8,6 +8,7 @@ from openai import OpenAI
 import os # Import os to access environment variables
 import sqlite3
 import tempfile
+import re
 
 # Placeholder for Groq API key loading
 # Use Streamlit secrets or environment variables for secure access
@@ -91,6 +92,17 @@ def create_excel_database(uploaded_file):
         # Read Excel file into pandas DataFrame
         df = pd.read_excel(uploaded_file)
         
+        # Clean column names to avoid SQL issues
+        df.columns = df.columns.astype(str)  # Convert to string
+        df.columns = [col.strip().replace(' ', '_').replace('-', '_').replace('.', '_') for col in df.columns]
+        
+        # Remove any special characters that might cause SQL issues
+        import re
+        df.columns = [re.sub(r'[^\w_]', '_', col) for col in df.columns]
+        
+        # Ensure column names don't start with numbers
+        df.columns = [f"col_{col}" if col[0].isdigit() else col for col in df.columns]
+        
         # Create a temporary SQLite database
         temp_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
         conn = sqlite3.connect(temp_db.name)
@@ -130,19 +142,19 @@ def create_excel_database(uploaded_file):
         schema_parts.append("\n=== DATA INSIGHTS ===")
         
         for col_name in column_names:
-            # Get unique value count
-            cursor.execute(f"SELECT COUNT(DISTINCT {col_name}) FROM data_table")
+            # Get unique value count - use quoted column names to handle special cases
+            cursor.execute(f'SELECT COUNT(DISTINCT "{col_name}") FROM data_table')
             unique_count = cursor.fetchone()[0]
             
             # Get null count
-            cursor.execute(f"SELECT COUNT(*) FROM data_table WHERE {col_name} IS NULL")
+            cursor.execute(f'SELECT COUNT(*) FROM data_table WHERE "{col_name}" IS NULL')
             null_count = cursor.fetchone()[0]
             
             schema_parts.append(f"  • {col_name}: {unique_count} unique values, {null_count} nulls")
             
             # If it's a categorical column (low unique count), show sample values
             if unique_count <= 10 and unique_count > 1:
-                cursor.execute(f"SELECT DISTINCT {col_name} FROM data_table WHERE {col_name} IS NOT NULL LIMIT 5")
+                cursor.execute(f'SELECT DISTINCT "{col_name}" FROM data_table WHERE "{col_name}" IS NOT NULL LIMIT 5')
                 unique_values = [str(row[0]) for row in cursor.fetchall()]
                 schema_parts.append(f"    Sample values: {', '.join(unique_values)}")
         
@@ -191,7 +203,7 @@ CRITICAL INSTRUCTIONS:
 - No explanations, comments, or markdown formatting
 - Use proper SQLite syntax and functions
 - The table name is always 'data_table'
-- Be case-sensitive with column names as provided in the schema
+- ALWAYS use double quotes around column names to handle special characters (e.g., "column_name")
 - Use appropriate SQLite data types and functions
 - For text searches, use LIKE with wildcards (%) when appropriate
 - For numerical operations, use proper arithmetic operators
@@ -203,7 +215,14 @@ QUERY REQUIREMENTS:
 - Use GROUP BY and aggregate functions (COUNT, SUM, AVG, MAX, MIN) when needed
 - Use ORDER BY for sorting results when relevant
 - Use LIMIT only if the user specifically asks for a limited number of results
-- Handle NULL values appropriately"""},
+- Handle NULL values appropriately
+- Remember to quote ALL column names with double quotes
+
+EXAMPLES:
+- SELECT "Name", "Age" FROM data_table WHERE "Age" > 25
+- SELECT COUNT(*) FROM data_table WHERE "Status" = 'Active'
+- SELECT "Category", AVG("Price") FROM data_table GROUP BY "Category"
+"""},
                 {"role": "user", "content": f"""Database Schema and Context:
 {schema}
 
