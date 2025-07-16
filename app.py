@@ -115,13 +115,15 @@ def rag(retrieved_docs, query, conversation_history=None):
 
         Only answer questions using the data you have. Do not generate fictional content or hallucinate details not found in the context.
         
-        When the user asks follow-up questions, consider the conversation history to provide contextually relevant answers.
+        When the user asks follow-up questions, pay close attention to the conversation history to understand what "they", "their", "these", or other pronouns refer to. Use the conversation context to provide contextually relevant answers.
+        
+        IMPORTANT: When users ask follow-up questions using pronouns (like "their numbers", "what about them", etc.), refer back to the conversation history to understand what specific entities they're referring to, and then answer accordingly using the current context data.
         """}
     ]
     
-    # Add conversation history if available
+    # Add conversation history if available - include more context for follow-up questions
     if conversation_history:
-        for msg in conversation_history[-6:]:  # Keep last 6 messages for context
+        for msg in conversation_history[-8:]:  # Keep last 8 messages for better context
             if msg["role"] == "user":
                 messages.append({"role": "user", "content": msg["content"]})
             else:
@@ -136,6 +138,8 @@ def rag(retrieved_docs, query, conversation_history=None):
 
               Answer the following question:
               {query}
+
+              IMPORTANT: If this is a follow-up question using pronouns (like "their", "they", "these", etc.), refer to the previous conversation to understand what specific entities are being referenced, then provide the relevant information from the current context.
 
               If the answer cannot be found in the context, say The context does not contain enough information to answer this question. then explain why it does not contain enough information.
             """})
@@ -337,6 +341,14 @@ def prepare_excel_data(db_path: str, schema: str, query: str, k: int = 2):
             base_url="https://api.groq.com/openai/v1"
         )
 
+        # Include conversation history in SQL generation for better context understanding
+        conversation_context = ""
+        if st.session_state.conversation_history:
+            recent_messages = st.session_state.conversation_history[-6:]  # Last 6 messages
+            conversation_context = "\n\nRecent Conversation History:\n"
+            for msg in recent_messages:
+                conversation_context += f"{msg['role'].title()}: {msg['content']}\n"
+
         sql_response = client.chat.completions.create(
             model="meta-llama/llama-4-scout-17b-16e-instruct",
             messages=[
@@ -362,11 +374,18 @@ QUERY REQUIREMENTS:
 - Handle NULL values appropriately
 - Always use double quotes around column names like "column_name"
 
+FOLLOW-UP QUESTIONS:
+- Pay attention to conversation history to understand context
+- When users ask follow-up questions with pronouns (like "their numbers", "what about them"), refer to the conversation history to understand what specific entities they're referring to
+- Generate queries that can provide the requested information about those specific entities
+
 EXAMPLE:
 Instead of: SELECT Name, Age FROM data_table
 Use: SELECT "Name", "Age" FROM data_table"""},
                 {"role": "user", "content": f"""Database Schema and Context:
 {schema}
+
+{conversation_context}
 
 User Question: {query}
 
