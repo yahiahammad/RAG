@@ -21,18 +21,8 @@ except KeyError:
     st.stop() # Stop execution if the key is not found
 
 
-def rag(retrieved_docs, query):
-    """
-    Performs Retrieval-Augmented Generation (RAG) using retrieved document chunks
-    and a user query to generate an answer.
-
-    Args:
-        retrieved_docs: A list of strings containing the content of retrieved document chunks.
-        query: The user's query string.
-
-    Returns:
-        str: The generated answer from the language model.
-    """
+def rag(retrieved_docs, query, conversation_history=None):
+    
     context = "\n".join(retrieved_docs)
 
     client = OpenAI(
@@ -40,30 +30,44 @@ def rag(retrieved_docs, query):
         base_url="https://api.groq.com/openai/v1"
     )
 
+    # Build the conversation messages
+    messages = [
+        {"role": "system", "content": """
+        You are a helpful and knowledgeable assistant. When answering questions, use the most relevant information from the provided context. Be concise, avoid speculation, and favor well-supported answers.
+
+        For structured data (like database results), present the information clearly and highlight key findings. When dealing with mixed or contradictory information, acknowledge both sides.
+
+        If asked about specific data points, summarize the most relevant information. If asked for comparisons or analysis, emphasize the differences and similarities based on the data provided.
+
+        Only answer questions using the data you have. Do not generate fictional content or hallucinate details not found in the context.
+        
+        Consider the conversation history when answering follow-up questions, but always prioritize the current context data.
+        """}
+    ]
+
+    # Add conversation history if available
+    if conversation_history:
+        messages.extend(conversation_history)
+
+    # Add the current query with context
+    messages.append({
+        "role": "user", 
+        "content": f"""
+          Using the information in the following context, answer the question clearly and accurately.
+
+          Context:
+          {context}
+
+          Answer the following question:
+          {query}
+
+          If the answer cannot be found in the context, say The context does not contain enough information to answer this question. then explain why it does not contain enough information.
+        """
+    })
+
     response = client.chat.completions.create(
         model="meta-llama/llama-4-scout-17b-16e-instruct",
-        messages=[
-            {"role": "system", "content": """
-            You are a helpful and knowledgeable assistant. When answering questions, use the most relevant information from the provided context. Be concise, avoid speculation, and favor well-supported answers.
-
-            For structured data (like database results), present the information clearly and highlight key findings. When dealing with mixed or contradictory information, acknowledge both sides.
-
-            If asked about specific data points, summarize the most relevant information. If asked for comparisons or analysis, emphasize the differences and similarities based on the data provided.
-
-            Only answer questions using the data you have. Do not generate fictional content or hallucinate details not found in the context.
-            """},
-            {"role": "user", "content": f"""
-              Using the information in the following context, answer the question clearly and accurately.
-
-              Context:
-              {context}
-
-              Answer the following question:
-              {query}
-
-              If the answer cannot be found in the context, say The context does not contain enough information to answer this question. then explain why it does not contain enough information.
-            """}
-        ],
+        messages=messages,
         temperature=0.7
     )
 
@@ -239,7 +243,21 @@ Generate the SQL query:"""}
             result_text = f"SQL Query: {sql_query}\n\nNo results found."
 
         # Use RAG to generate a natural language answer
-        return rag([result_text], query)
+        conversation_history = st.session_state.get('conversation_history', [])
+        answer = rag([result_text], query, conversation_history)
+        
+        # Update conversation history
+        if 'conversation_history' not in st.session_state:
+            st.session_state.conversation_history = []
+        
+        st.session_state.conversation_history.append({"role": "user", "content": query})
+        st.session_state.conversation_history.append({"role": "assistant", "content": answer})
+        
+        # Keep only the last 10 exchanges (20 messages) to prevent context from getting too long
+        if len(st.session_state.conversation_history) > 20:
+            st.session_state.conversation_history = st.session_state.conversation_history[-20:]
+        
+        return answer
         
     except Exception as e:
         st.error(f"An error occurred during Excel data preparation: {e}")
@@ -286,7 +304,21 @@ def prepare_pdf_data(index: faiss.IndexFlatL2, chunks: list, query: str, k: int 
         D, I = index.search(query_embedding, k=k)
         retrieved_docs = [chunks[i].page_content for i in I[0]]
 
-        return rag(retrieved_docs, query)
+        conversation_history = st.session_state.get('conversation_history', [])
+        answer = rag(retrieved_docs, query, conversation_history)
+        
+        # Update conversation history
+        if 'conversation_history' not in st.session_state:
+            st.session_state.conversation_history = []
+        
+        st.session_state.conversation_history.append({"role": "user", "content": query})
+        st.session_state.conversation_history.append({"role": "assistant", "content": answer})
+        
+        # Keep only the last 10 exchanges (20 messages) to prevent context from getting too long
+        if len(st.session_state.conversation_history) > 20:
+            st.session_state.conversation_history = st.session_state.conversation_history[-20:]
+        
+        return answer
     except Exception as e:
         st.error(f"An error occurred during PDF data preparation: {e}")
         return None
@@ -295,6 +327,18 @@ def prepare_pdf_data(index: faiss.IndexFlatL2, chunks: list, query: str, k: int 
 st.title("RAG Application")
 
 st.write("Upload a document (Excel or PDF) and ask questions about its content.")
+
+# Display conversation history if it exists
+if 'conversation_history' in st.session_state and st.session_state.conversation_history:
+    with st.expander("💬 Conversation History", expanded=False):
+        for i in range(0, len(st.session_state.conversation_history), 2):
+            if i + 1 < len(st.session_state.conversation_history):
+                user_msg = st.session_state.conversation_history[i]
+                assistant_msg = st.session_state.conversation_history[i + 1]
+                
+                st.write(f"**Q{(i//2)+1}:** {user_msg['content']}")
+                st.write(f"**A{(i//2)+1}:** {assistant_msg['content']}")
+                st.write("---")
 
 # Layout using columns
 col1, col2 = st.columns([2, 1])
@@ -305,6 +349,13 @@ with col1:
 
 with col2:
     k_value = st.slider("Number of relevant documents to retrieve (k)", 1, 10, 2)
+    
+    # Add a button to clear conversation history
+    if st.button("Clear Chat History"):
+        if 'conversation_history' in st.session_state:
+            st.session_state.conversation_history = []
+            st.success("Chat history cleared!")
+            st.rerun()
 
 # Add a button to trigger the RAG process
 if st.button("Get Answer"):
