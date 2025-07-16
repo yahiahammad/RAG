@@ -166,6 +166,24 @@ def create_excel_database(uploaded_file):
         # Read Excel file into pandas DataFrame
         df = pd.read_excel(uploaded_file)
         
+        # Store original column names for reference
+        original_columns = df.columns.tolist()
+        
+        # Clean column names to avoid SQL issues
+        # Replace spaces with underscores and remove special characters
+        df.columns = df.columns.str.replace(' ', '_', regex=False)
+        df.columns = df.columns.str.replace('[^a-zA-Z0-9_]', '', regex=True)
+        
+        # Handle empty column names
+        df.columns = ['col_' + str(i) if col == '' else col for i, col in enumerate(df.columns)]
+        
+        # Ensure column names don't start with numbers
+        df.columns = ['col_' + col if col and col[0].isdigit() else col for col in df.columns]
+        
+        # Handle reserved SQL keywords by prefixing with 'col_'
+        sql_keywords = {'name', 'order', 'group', 'select', 'from', 'where', 'table', 'column', 'index', 'key', 'primary', 'foreign', 'unique', 'null', 'not', 'and', 'or', 'in', 'is', 'like', 'between', 'exists', 'all', 'any', 'some', 'union', 'intersect', 'except', 'join', 'inner', 'outer', 'left', 'right', 'full', 'cross', 'natural', 'on', 'using', 'case', 'when', 'then', 'else', 'end', 'if', 'count', 'sum', 'avg', 'min', 'max', 'distinct', 'having', 'limit', 'offset', 'create', 'alter', 'drop', 'insert', 'update', 'delete', 'truncate', 'begin', 'commit', 'rollback', 'transaction', 'savepoint', 'release', 'grant', 'revoke', 'references', 'constraint', 'check', 'default', 'collate', 'autoincrement', 'temporary', 'temp', 'view', 'trigger', 'procedure', 'function', 'database', 'schema', 'pragma', 'explain', 'analyze', 'vacuum', 'reindex', 'attach', 'detach', 'conflict', 'fail', 'ignore', 'replace', 'abort', 'rollback', 'cascade', 'restrict', 'set', 'immediate', 'deferred', 'exclusive', 'shared', 'reserved', 'pending', 'unlocked'}
+        df.columns = ['col_' + col if col.lower() in sql_keywords else col for col in df.columns]
+        
         # Create a temporary SQLite database
         temp_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
         conn = sqlite3.connect(temp_db.name)
@@ -182,12 +200,14 @@ def create_excel_database(uploaded_file):
         schema_parts.append("=== DATABASE SCHEMA ===")
         schema_parts.append("Table: data_table")
         schema_parts.append("\nColumn Information:")
+        schema_parts.append("(Note: Column names have been cleaned for SQL compatibility)")
         
-        for col_info in columns_info:
+        for i, col_info in enumerate(columns_info):
             col_name = col_info[1]
             col_type = col_info[2]
             not_null = "NOT NULL" if col_info[3] else "NULLABLE"
-            schema_parts.append(f"  • {col_name}: {col_type} ({not_null})")
+            original_name = original_columns[i] if i < len(original_columns) else col_name
+            schema_parts.append(f'  • "{col_name}" (originally: "{original_name}"): {col_type} ({not_null})')
         
         # Add sample data with more detail
         cursor.execute("SELECT * FROM data_table LIMIT 3")
@@ -205,19 +225,19 @@ def create_excel_database(uploaded_file):
         schema_parts.append("\n=== DATA INSIGHTS ===")
         
         for col_name in column_names:
-            # Get unique value count
-            cursor.execute(f"SELECT COUNT(DISTINCT {col_name}) FROM data_table")
+            # Get unique value count with proper escaping
+            cursor.execute(f'SELECT COUNT(DISTINCT "{col_name}") FROM data_table')
             unique_count = cursor.fetchone()[0]
             
-            # Get null count
-            cursor.execute(f"SELECT COUNT(*) FROM data_table WHERE {col_name} IS NULL")
+            # Get null count with proper escaping
+            cursor.execute(f'SELECT COUNT(*) FROM data_table WHERE "{col_name}" IS NULL')
             null_count = cursor.fetchone()[0]
             
             schema_parts.append(f"  • {col_name}: {unique_count} unique values, {null_count} nulls")
             
             # If it's a categorical column (low unique count), show sample values
             if unique_count <= 10 and unique_count > 1:
-                cursor.execute(f"SELECT DISTINCT {col_name} FROM data_table WHERE {col_name} IS NOT NULL LIMIT 5")
+                cursor.execute(f'SELECT DISTINCT "{col_name}" FROM data_table WHERE "{col_name}" IS NOT NULL LIMIT 5')
                 unique_values = [str(row[0]) for row in cursor.fetchall()]
                 schema_parts.append(f"    Sample values: {', '.join(unique_values)}")
         
@@ -233,6 +253,8 @@ def create_excel_database(uploaded_file):
         return conn, schema
     except Exception as e:
         st.error(f"An error occurred during Excel database creation: {e}")
+        import traceback
+        st.error(f"Detailed error: {traceback.format_exc()}")
         return None
 
 def prepare_excel_data(conn: sqlite3.Connection, schema: str, query: str, k: int = 2):
@@ -266,7 +288,7 @@ CRITICAL INSTRUCTIONS:
 - No explanations, comments, or markdown formatting
 - Use proper SQLite syntax and functions
 - The table name is always 'data_table'
-- Be case-sensitive with column names as provided in the schema
+- ALWAYS wrap column names in double quotes to handle special characters and reserved words
 - Use appropriate SQLite data types and functions
 - For text searches, use LIKE with wildcards (%) when appropriate
 - For numerical operations, use proper arithmetic operators
@@ -278,13 +300,18 @@ QUERY REQUIREMENTS:
 - Use GROUP BY and aggregate functions (COUNT, SUM, AVG, MAX, MIN) when needed
 - Use ORDER BY for sorting results when relevant
 - Use LIMIT only if the user specifically asks for a limited number of results
-- Handle NULL values appropriately"""},
+- Handle NULL values appropriately
+- Always use double quotes around column names like "column_name"
+
+EXAMPLE:
+Instead of: SELECT Name, Age FROM data_table
+Use: SELECT "Name", "Age" FROM data_table"""},
                 {"role": "user", "content": f"""Database Schema and Context:
 {schema}
 
 User Question: {query}
 
-Generate the SQL query:"""}
+Generate the SQL query (remember to wrap all column names in double quotes):"""}
             ],
             temperature=0.1
         )
@@ -302,9 +329,14 @@ Generate the SQL query:"""}
 
         # Execute the SQL query
         cursor = conn.cursor()
-        cursor.execute(sql_query)
-        results = cursor.fetchall()
-        column_names = [description[0] for description in cursor.description]
+        try:
+            cursor.execute(sql_query)
+            results = cursor.fetchall()
+            column_names = [description[0] for description in cursor.description]
+        except sqlite3.Error as sql_error:
+            st.error(f"SQL execution error: {sql_error}")
+            st.error(f"Generated SQL query: {sql_query}")
+            return f"Error executing SQL query: {str(sql_error)}"
 
         # Format the results for the RAG function
         if results:
