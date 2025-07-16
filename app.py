@@ -199,7 +199,12 @@ def create_excel_database(uploaded_file):
         
         # Create a temporary SQLite database
         temp_db = tempfile.NamedTemporaryFile(delete=False, suffix='.db')
-        conn = sqlite3.connect(temp_db.name)
+        temp_db.close()  # Close the file handle immediately
+        
+        # Store the database path instead of the connection
+        db_path = temp_db.name
+        
+        conn = sqlite3.connect(db_path, check_same_thread=False)
         
         # Debug: Show the column transformation
         st.info(f"Debug: Original columns: {original_columns}")
@@ -219,6 +224,7 @@ def create_excel_database(uploaded_file):
                 st.success("Database created with generic column names")
             except Exception as fallback_error:
                 st.error(f"Fallback database creation also failed: {fallback_error}")
+                conn.close()
                 return None
         
         # Test the database by running a simple query
@@ -229,6 +235,7 @@ def create_excel_database(uploaded_file):
             st.success(f"Database created successfully with {row_count} rows")
         except Exception as test_error:
             st.error(f"Database creation test failed: {test_error}")
+            conn.close()
             return None
         
         # Generate schema information
@@ -299,20 +306,23 @@ def create_excel_database(uploaded_file):
         
         schema = "\n".join(schema_parts)
         
-        return conn, schema
+        conn.close()  # Close the connection after schema generation
+        
+        # Return the database path and schema instead of the connection
+        return db_path, schema
     except Exception as e:
         st.error(f"An error occurred during Excel database creation: {e}")
         import traceback
         st.error(f"Detailed error: {traceback.format_exc()}")
         return None
 
-def prepare_excel_data(conn: sqlite3.Connection, schema: str, query: str, k: int = 2):
+def prepare_excel_data(db_path: str, schema: str, query: str, k: int = 2):
     """
     Prepares Excel data for RAG by executing SQL queries on the database
     and using the results with the RAG function.
 
     Args:
-        conn: The SQLite database connection.
+        db_path: The path to the SQLite database file.
         schema: The database schema information.
         query: The user's natural language query.
         k: Not used for SQL-based approach, kept for compatibility.
@@ -376,8 +386,10 @@ Generate the SQL query (remember to wrap all column names in double quotes):"""}
             sql_query = sql_query[:-3]
         sql_query = sql_query.strip()
 
-        # Execute the SQL query
+        # Create a new connection for this thread
+        conn = sqlite3.connect(db_path, check_same_thread=False)
         cursor = conn.cursor()
+        
         try:
             cursor.execute(sql_query)
             results = cursor.fetchall()
@@ -386,6 +398,8 @@ Generate the SQL query (remember to wrap all column names in double quotes):"""}
             st.error(f"SQL execution error: {sql_error}")
             st.error(f"Generated SQL query: {sql_query}")
             return f"Error executing SQL query: {str(sql_error)}"
+        finally:
+            conn.close()  # Always close the connection
 
         # Format the results for the RAG function
         if results:
@@ -507,10 +521,12 @@ with st.sidebar:
         st.rerun()
     
     if st.button("🔄 Clear All Data"):
-        # Close database connections if they exist
-        if "excel_conn" in st.session_state:
+        # Clean up database file if it exists
+        if "excel_db_path" in st.session_state:
             try:
-                st.session_state.excel_conn.close()
+                import os
+                if os.path.exists(st.session_state.excel_db_path):
+                    os.remove(st.session_state.excel_db_path)
             except:
                 pass
         # Clear the session state and rerun the app to reset
@@ -542,22 +558,22 @@ if uploaded_file is not None:
                 
                 if file_extension == "xlsx":
                     # Create the database only once and store it in session state
-                    if "excel_conn" not in st.session_state or "excel_schema" not in st.session_state or st.session_state.get("uploaded_excel_name") != uploaded_file.name:
+                    if "excel_db_path" not in st.session_state or "excel_schema" not in st.session_state or st.session_state.get("uploaded_excel_name") != uploaded_file.name:
                         with st.spinner("📊 Creating Excel database..."):
                             result = create_excel_database(uploaded_file)
                         if result is not None:
-                            conn, schema = result
-                            st.session_state.excel_conn = conn
+                            db_path, schema = result
+                            st.session_state.excel_db_path = db_path
                             st.session_state.excel_schema = schema
                             st.session_state.uploaded_excel_name = uploaded_file.name
                         else:
                             st.error("Failed to create Excel database. Please try again.")
                             st.stop()
                     else:
-                        conn = st.session_state.excel_conn
+                        db_path = st.session_state.excel_db_path
                         schema = st.session_state.excel_schema
                     
-                    answer = prepare_excel_data(conn, schema, query, k_value)
+                    answer = prepare_excel_data(db_path, schema, query, k_value)
                     
                 elif file_extension == "pdf":
                     # Create the database only once and store it in session state
@@ -608,7 +624,7 @@ with st.expander("💡 Tips for better conversations"):
 if uploaded_file is not None:
     file_extension = uploaded_file.name.split(".")[-1].lower()
     
-    if file_extension == "xlsx" and "excel_conn" in st.session_state:
+    if file_extension == "xlsx" and "excel_db_path" in st.session_state:
         st.success("✅ Excel database ready for queries")
     elif file_extension == "pdf" and "pdf_index" in st.session_state:
         st.success("✅ PDF database ready for queries")
