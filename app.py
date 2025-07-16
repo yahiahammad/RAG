@@ -151,14 +151,14 @@ def rag(retrieved_docs, query, conversation_history=None):
 
 def create_excel_database(uploaded_file):
     """
-    Creates a SQLite database from an uploaded Excel file and returns the database connection and schema.
+    Creates a SQLite database from an uploaded Excel file and returns the database path and schema.
 
     Args:
         uploaded_file: The uploaded file object from Streamlit.
 
     Returns:
         A tuple containing:
-            - sqlite3.Connection: The SQLite database connection.
+            - str: The path to the SQLite database file.
             - str: The database schema information.
         Returns None if an error occurs.
     """
